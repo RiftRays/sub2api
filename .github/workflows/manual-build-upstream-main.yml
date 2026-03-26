@@ -1,0 +1,179 @@
+name: Manual Build Upstream Main
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream ref to build, default is main"
+        required: true
+        default: "main"
+        type: string
+      target_arch:
+        description: "Target Linux architecture"
+        required: true
+        default: "amd64"
+        type: choice
+        options:
+          - amd64
+          - arm64
+          - both
+      run_unit_tests:
+        description: "Run backend unit tests before build"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Set matrix
+        id: set-matrix
+        shell: bash
+        run: |
+          case "${{ inputs.target_arch }}" in
+            amd64)
+              echo 'matrix={"goarch":["amd64"]}' >> "$GITHUB_OUTPUT"
+              ;;
+            arm64)
+              echo 'matrix={"goarch":["arm64"]}' >> "$GITHUB_OUTPUT"
+              ;;
+            both)
+              echo 'matrix={"goarch":["amd64","arm64"]}' >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unsupported target_arch: ${{ inputs.target_arch }}" >&2
+              exit 1
+              ;;
+          esac
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Checkout upstream source
+        uses: actions/checkout@v6
+        with:
+          repository: Wei-Shaw/sub2api
+          ref: ${{ inputs.upstream_ref }}
+          fetch-depth: 1
+
+      - name: Resolve build metadata
+        id: meta
+        shell: bash
+        run: |
+          SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+          VERSION="$(tr -d '\r\n' < backend/cmd/server/VERSION)"
+          BUILD_TIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          BUILD_VERSION="${VERSION}-main.${SHORT_SHA}"
+
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build_time=${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+          echo "build_version=${BUILD_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: frontend
+
+      - name: Build frontend
+        run: pnpm run build
+        working-directory: frontend
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache-dependency-path: backend/go.sum
+
+      - name: Verify Go version
+        shell: bash
+        run: |
+          go version | grep -q 'go1.26.1'
+
+      - name: Run backend unit tests
+        if: ${{ inputs.run_unit_tests }}
+        run: make test-unit
+        working-directory: backend
+
+      - name: Build linux binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} \
+            go -C backend build \
+            -tags=embed \
+            -trimpath \
+            -ldflags="-s -w -X main.Version=${{ steps.meta.outputs.build_version }} -X main.Commit=${{ steps.meta.outputs.short_sha }} -X main.Date=${{ steps.meta.outputs.build_time }} -X main.BuildType=manual-main" \
+            -o "../dist/sub2api_${{ steps.meta.outputs.build_version }}_linux_${{ matrix.goarch }}" \
+            ./cmd/server
+
+      - name: Package build output
+        shell: bash
+        run: |
+          ARTIFACT_BASENAME="sub2api_${{ steps.meta.outputs.build_version }}_linux_${{ matrix.goarch }}"
+          PACKAGE_DIR="package/${ARTIFACT_BASENAME}"
+          mkdir -p "${PACKAGE_DIR}"
+
+          cp "dist/${ARTIFACT_BASENAME}" "${PACKAGE_DIR}/sub2api"
+          chmod +x "${PACKAGE_DIR}/sub2api"
+          sha256sum "dist/${ARTIFACT_BASENAME}" > "${PACKAGE_DIR}/SHA256SUMS"
+
+          cat > "${PACKAGE_DIR}/BUILD_INFO.txt" <<EOF
+          upstream_repository=Wei-Shaw/sub2api
+          upstream_ref=${{ inputs.upstream_ref }}
+          upstream_commit=${{ steps.meta.outputs.short_sha }}
+          embedded_version=${{ steps.meta.outputs.version }}
+          build_version=${{ steps.meta.outputs.build_version }}
+          build_type=manual-main
+          build_time_utc=${{ steps.meta.outputs.build_time }}
+          target_os=linux
+          target_arch=${{ matrix.goarch }}
+          EOF
+
+          tar -C package -czf "dist/${ARTIFACT_BASENAME}.tar.gz" "${ARTIFACT_BASENAME}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sub2api_${{ steps.meta.outputs.build_version }}_linux_${{ matrix.goarch }}
+          path: |
+            dist/sub2api_${{ steps.meta.outputs.build_version }}_linux_${{ matrix.goarch }}
+            dist/sub2api_${{ steps.meta.outputs.build_version }}_linux_${{ matrix.goarch }}.tar.gz
+          retention-days: 30
+
+      - name: Publish summary
+        shell: bash
+        run: |
+          {
+            echo "## Sub2API manual build"
+            echo ""
+            echo "- Upstream ref: \`${{ inputs.upstream_ref }}\`"
+            echo "- Upstream commit: \`${{ steps.meta.outputs.short_sha }}\`"
+            echo "- Embedded version: \`${{ steps.meta.outputs.version }}\`"
+            echo "- Build version: \`${{ steps.meta.outputs.build_version }}\`"
+            echo "- Target: \`linux/${{ matrix.goarch }}\`"
+            echo "- Unit tests: \`${{ inputs.run_unit_tests }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
